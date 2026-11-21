@@ -27,6 +27,8 @@ import { encodeRaw } from "./raw"
 import type { Socket } from "./socket"
 
 const PERSON_SERVERS = ["@s.whatsapp.net", "@lid", "@hosted", "@hosted.lid", "@bot"]
+// Free-tier cap: keep newest messages per history batch so SQLite row writes stay well under 100k/day
+const MAX_HISTORY_BATCH_MESSAGES = 250
 
 function isPerson(jid: string): boolean {
   return PERSON_SERVERS.some((server) => jid.endsWith(server))
@@ -218,8 +220,12 @@ export function syncArchive(socket: Socket, archive: Archive, hooks: SyncHooks =
     for (const { lid, pn } of batch.lidPnMappings ?? []) ingest.pair(lid, pn)
     for (const contact of batch.contacts) ingest.contact(contact, "history")
     chats(batch.chats)
-    // Saved first: an optional call would skip evaluating its argument.
-    const { saved } = ingest.messages(batch.messages)
+    // Trim history batch to the newest messages to stay within Cloudflare Free Tier SQLite write limits
+    const trimmed =
+      batch.messages.length > MAX_HISTORY_BATCH_MESSAGES
+        ? batch.messages.slice(-MAX_HISTORY_BATCH_MESSAGES)
+        : batch.messages
+    const { saved } = ingest.messages(trimmed)
     hooks.onMessages?.(saved, "history")
     if (batch.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND) {
       hooks.onHistoryBatch?.(batch.progress ?? null)
