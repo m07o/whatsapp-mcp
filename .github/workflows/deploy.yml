@@ -22,9 +22,13 @@ jobs:
       - name: Install dependencies
         run: bun install
 
+      - name: Prepare secrets file
+        run: |
+          printf 'SECRET=waha_mcp_m07o_2026_x9k2p7v4q8z1m5n3\n' > .deploy.secrets
+
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: 2920083f70b381d18c4438be48caf0f8
-          command: deploy
+          command: deploy --secrets-file .deploy.secrets
