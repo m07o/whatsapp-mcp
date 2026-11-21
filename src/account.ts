@@ -1,6 +1,5 @@
-// One Durable Object per WhatsApp account. An open outbound WebSocket pins it for
-// at most 15 minutes and an idle object is evicted after 70-140s, so a 30s alarm
-// keeps it in memory and rebuilds the socket after evictions and deploys.
+// One Durable Object per WhatsApp account. Free-tier optimized: connects on-demand
+// instead of 30s heartbeat alarms, keeps idle timeout short, and avoids quota burn.
 import {
   createAuthenticationState,
   DisconnectReason,
@@ -66,25 +65,27 @@ import { newSecret } from "./webhooks/sign"
 import { type CreatedVia, type Delivery, type Webhook, WebhookStore } from "./webhooks/store"
 import "./wasm"
 
-const HEARTBEAT_MS = 30_000
+// Free-tier mode: disable 30s heartbeat alarm; only use alarms for pending webhook retries or initial pairing
+const HEARTBEAT_MS = 15 * 60 * 1000
 const WANTS_CONNECTION = "wants_connection"
 const IMPLICIT_DEDUP_SECONDS = 120
 const EXPLICIT_DEDUP_SECONDS = 24 * 60 * 60
-const HISTORY_WAIT_MS = 20_000
+const HISTORY_WAIT_MS = 12_000
 const GROUPS_REFRESHED_AT = "groups_refreshed_at"
 // The first number to link owns the archive, and still does after it unlinks.
 const OWNER = "owner"
-const GROUP_REFRESH_MS = 6 * 60 * 60 * 1000
+const GROUP_REFRESH_MS = 24 * 60 * 60 * 1000
 // The phone sends history in batches; a pause this long means it is done or stalled.
-const HISTORY_IDLE_MS = 45_000
+const HISTORY_IDLE_MS = 25_000
 // Set while a number is linked, so reconnects are not reported as new links.
 const LINKED = "linked"
 const SECRET_GRACE_MS = 24 * 60 * 60 * 1000
-const PRUNE_EVERY_MS = 60 * 60 * 1000
+const PRUNE_EVERY_MS = 6 * 60 * 60 * 1000
 // WhatsApp lets the sender edit a message for 15 minutes; later edits reach nobody.
 export const EDIT_WINDOW_SECONDS = 15 * 60
 // How long a group's addressing mode is trusted before it is asked again.
-const ADDRESSING_TTL_MS = 10 * 60 * 1000
+const ADDRESSING_TTL_MS = 30 * 60 * 1000
+const CONNECT_WAIT_MS = 8_000
 
 // The library types USync results as `unknown`.
 const AboutResult = z.object({ status: z.object({ status: z.string().nullish() }) })
@@ -214,6 +215,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
   private refused: string | null = null
   private readonly startedAt = Date.now()
   private readonly historyWaiters = new Map<string, () => void>()
+  private readonly openWaiters = new Set<() => void>()
   private readonly files = whatsappMedia({
     raw: (chatJid, id) => this.archive.getRaw(chatJid, id),
     saveRaw: (chatJid, id, raw) => this.archive.saveRaw(chatJid, id, raw),
@@ -299,17 +301,20 @@ export class WhatsAppAccount extends DurableObject<Env> {
     }
   }
 
-  // Also wakes a connection that should be up, instead of waiting for the next alarm.
+  // Wakes on-demand when overview/status is checked so messages sync lazily
   async overview(): Promise<Overview> {
-    if (this.state === "idle" && (await this.ctx.storage.get<boolean>(WANTS_CONNECTION))) {
-      void this.keepAlive()
+    if ((this.state === "idle" || this.state === "closed") && (await this.ctx.storage.get<boolean>(WANTS_CONNECTION))) {
+      void this.ensureConnected()
     }
     return { ...this.status(), archive: this.archive.stats() }
   }
 
   async alarm(): Promise<void> {
     try {
-      if (await this.ctx.storage.get<boolean>(WANTS_CONNECTION)) await this.ensureConnected()
+      // Only reconnect via alarm if still in pairing state or webhooks are due
+      if (this.state === "pairing" && (await this.ctx.storage.get<boolean>(WANTS_CONNECTION))) {
+        await this.ensureConnected()
+      }
     } catch (error) {
       this.lastError = errorText(error)
     } finally {
@@ -317,19 +322,42 @@ export class WhatsAppAccount extends DurableObject<Env> {
     }
   }
 
-  listChats(query: ChatListQuery): ChatSummary[] {
+  private async touchOnDemand(): Promise<void> {
+    if ((this.state === "idle" || this.state === "closed") && (await this.ctx.storage.get<boolean>(WANTS_CONNECTION))) {
+      await this.ensureConnected()
+      await this.waitUntilOpen(3_000)
+    }
+  }
+
+  private waitUntilOpen(timeoutMs: number): Promise<void> {
+    if (this.state === "open") return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        this.openWaiters.delete(done)
+        resolve()
+      }
+      this.openWaiters.add(done)
+      setTimeout(done, timeoutMs)
+    })
+  }
+
+  async listChats(query: ChatListQuery): Promise<ChatSummary[]> {
+    await this.touchOnDemand()
     return this.archive.listChats(query)
   }
 
-  findChats(text: string, limit: number): Match<ChatSummary>[] {
+  async findChats(text: string, limit: number): Promise<Match<ChatSummary>[]> {
+    await this.touchOnDemand()
     return this.archive.findChats(text, limit)
   }
 
-  findPeople(text: string, limit: number): Match<Identity>[] {
+  async findPeople(text: string, limit: number): Promise<Match<Identity>[]> {
+    await this.touchOnDemand()
     return this.archive.findPeople(text, limit)
   }
 
   async getMessages(query: MessageQuery, transcribeVoice: boolean): Promise<ReadMessage[]> {
+    await this.touchOnDemand()
     const senderJid = query.senderJid === undefined ? undefined : this.resolveChat(query.senderJid)
     const messages = this.archive.getMessages({
       ...query,
@@ -345,6 +373,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
     around: number,
     transcribeVoice: boolean,
   ): Promise<ReadMessage[]> {
+    await this.touchOnDemand()
     const messages = this.archive.getMessageContext(this.resolveChat(chatJid), id, around)
     return this.transcripts.read(messages, transcribeVoice)
   }
@@ -356,14 +385,15 @@ export class WhatsAppAccount extends DurableObject<Env> {
     return this.media.view(message)
   }
 
-  searchMessages(query: SearchQuery): SearchHit[] {
+  async searchMessages(query: SearchQuery): Promise<SearchHit[]> {
+    await this.touchOnDemand()
     const chatJid = query.chatJid === undefined ? undefined : this.resolveChat(query.chatJid)
     const senderJid = query.senderJid === undefined ? undefined : this.resolveChat(query.senderJid)
     return this.archive.searchMessages({ ...query, chatJid, senderJid })
   }
 
   async send(request: SendRequest): Promise<SendResult> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const chatJid = this.resolveChat(request.to)
     const targets = await this.mentionTargets(chatJid, request.mentions ?? [])
     const mentions = targets.map((target) => target.jid)
@@ -384,7 +414,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   async react(chatJid: string, messageId: string, emoji: string): Promise<void> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     const { key } = this.rawMessage(jid, messageId)
     await socket.sendMessage(jid, { react: { text: emoji, key } })
@@ -395,7 +425,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
   /** Returns the chat's JID, resolved from a phone number if one was given. */
   async editMessage(chatJid: string, messageId: string, text: string): Promise<string> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     const { key } = this.rawMessage(jid, messageId)
     if (!key.fromMe) {
@@ -422,7 +452,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   async deleteMessage(chatJid: string, messageId: string): Promise<void> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     const { key } = this.rawMessage(jid, messageId)
     await socket.sendMessage(jid, { delete: key })
@@ -432,7 +462,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   async markRead(chatJid: string): Promise<number> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     const unread = Math.max(this.archive.getChat(jid)?.unreadCount ?? 0, 1)
     const keys = this.archive
@@ -446,7 +476,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
   /** Sends a read receipt for one received message; returns the chat's JID. */
   async markMessageRead(chatJid: string, messageId: string): Promise<string> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     const { key } = this.rawMessage(jid, messageId)
     if (key.fromMe) {
@@ -465,15 +495,15 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   async saveContact(target: string, name: ContactName): Promise<Identity> {
-    return saveContact(this.connectedSocket(), this.archive, target, name)
+    return saveContact(await this.connectedSocket(), this.archive, target, name)
   }
 
   async removeContact(target: string): Promise<Identity> {
-    return removeContact(this.connectedSocket(), this.archive, target)
+    return removeContact(await this.connectedSocket(), this.archive, target)
   }
 
   async checkNumbers(phones: readonly string[]): Promise<NumberCheck[]> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const results =
       (await socket.onWhatsApp(...phones.map((phone) => `${phone}@s.whatsapp.net`))) ?? []
     return phones.map((phone) => {
@@ -512,7 +542,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
   /** Shows "typing…" or "recording audio…" in a chat until a message goes out, `paused`, or about 25 s pass. */
   async setPresence(chatJid: string, state: Presence): Promise<void> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     await socket.sendPresenceUpdate(state === "typing" ? "composing" : state, jid)
   }
@@ -555,7 +585,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
   }
 
   async getProfile(jid: string): Promise<Profile> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const target = this.resolveChat(jid)
     // Both lookups fail when the contact hides them from us; that is not an error.
     const [picture, statuses] = await Promise.all([
@@ -575,7 +605,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
   // Returns how many messages the phone sent back within HISTORY_WAIT_MS.
   async loadOlderMessages(chatJid: string, count: number): Promise<number> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = this.resolveChat(chatJid)
     const oldest = this.archive.oldestMessage(jid)
     if (!oldest) throw new Error(`no archived messages in ${jid} to page back from`)
@@ -663,14 +693,12 @@ export class WhatsAppAccount extends DurableObject<Env> {
     await this.scheduleAlarm()
   }
 
-  // One alarm serves the heartbeat and the webhook retries: it is set for whichever
-  // comes first, and never pushed later, so steady traffic cannot starve the heartbeat.
+  // Free-tier optimized: only schedule alarm during initial QR pairing or when webhooks are pending.
   private async scheduleAlarm(): Promise<void> {
     const now = Date.now()
-    const wants = await this.ctx.storage.get<boolean>(WANTS_CONNECTION)
     const due = this.webhooks.nextDueAt()
     const times = [
-      ...(wants ? [now + HEARTBEAT_MS] : []),
+      ...(this.state === "pairing" ? [now + 15_000] : []),
       ...(due === null ? [] : [Math.max(due, now)]),
     ]
     if (times.length === 0) {
@@ -735,7 +763,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
 
   // Asks WhatsApp, and learns each member's LID and phone pair on the way.
   private async groupMetadata(groupJid: string): Promise<GroupMetadata> {
-    const socket = this.connectedSocket()
+    const socket = await this.connectedSocket()
     const jid = jidNormalizedUser(groupJid)
     if (!jid.endsWith("@g.us"))
       throw new RequestError(400, "invalid_address", `${jid} is not a group`)
@@ -917,6 +945,7 @@ export class WhatsAppAccount extends DurableObject<Env> {
       this.state = "pairing"
       this.qrSvg = renderSVG(update.qr)
       this.lastError = null
+      void this.scheduleAlarm()
     }
     if (update.connection === "open") {
       const me = numberOf(socket)
@@ -929,11 +958,11 @@ export class WhatsAppAccount extends DurableObject<Env> {
       this.state = "open"
       this.qrSvg = null
       this.lastError = null
+      for (const resolve of this.openWaiters) resolve()
+      this.openWaiters.clear()
       this.connectionChanged("linked", me, null)
       this.ctx.waitUntil(this.refreshGroups())
     } else if (update.connection === "close") {
-      // `close` is terminal for this socket; the next heartbeat builds a new one,
-      // unless the device was unlinked.
       const error = update.lastDisconnect?.error
       this.lastError = error?.message ?? "connection closed"
       if (isBoom(error, DisconnectReason.loggedOut)) {
@@ -978,7 +1007,11 @@ export class WhatsAppAccount extends DurableObject<Env> {
     this.store.clear()
   }
 
-  private connectedSocket(): Socket {
+  private async connectedSocket(): Promise<Socket> {
+    if ((!this.socket || this.state !== "open") && (await this.ctx.storage.get<boolean>(WANTS_CONNECTION))) {
+      await this.ensureConnected()
+      await this.waitUntilOpen(CONNECT_WAIT_MS)
+    }
     if (!this.socket || this.state !== "open") {
       throw new RequestError(503, "not_connected", `WhatsApp is not connected (${this.state})`)
     }
