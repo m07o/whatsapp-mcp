@@ -39,6 +39,19 @@ const REST_METHODS: Record<string, string> = {
   erase: "POST",
 }
 
+const DISCOVERY_METHODS = new Set(["initialize", "notifications/initialized", "tools/list", "ping"])
+
+async function isMcpDiscovery(request: Request): Promise<boolean> {
+  if (request.method !== "POST") return false
+  try {
+    const body = (await request.clone().json()) as { method?: unknown } | Array<{ method?: unknown }>
+    const items = Array.isArray(body) ? body : [body]
+    return items.length > 0 && items.every((item) => typeof item?.method === "string" && DISCOVERY_METHODS.has(item.method))
+  } catch {
+    return false
+  }
+}
+
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const config = readAuthConfig(env)
@@ -69,9 +82,14 @@ export default {
       case "login":
         return signIn(request, env, config, accountId)
       case "mcp":
+        if (await hasBearerSecret(request, config)) {
+          return serveMcp(request, env, ctx, accountId)
+        }
+        if (!bearerToken(request) && (await isMcpDiscovery(request))) {
+          return serveMcp(request, env, ctx, accountId)
+        }
         if (oauth) return oauth.resource.fetch(request, env, ctx)
-        if (!(await hasBearerSecret(request, config))) return unauthorized()
-        return serveMcp(request, env, ctx, accountId)
+        return unauthorized()
       case "authorize":
         if (!oauth) return notFound()
         return authorize(request, env, config, accountId, oauth)
@@ -129,8 +147,6 @@ async function rest(
   }
 }
 
-// Same credentials as the rest of the API. The object answers with its own status
-// codes, so a refusal such as an edit after WhatsApp's window keeps its `code`.
 async function serveApi(
   request: Request,
   env: Env,
@@ -146,8 +162,6 @@ async function serveApi(
   return account.fetch(new Request(`https://account/${action}${search}`, request))
 }
 
-// Webhooks are managed with the same credentials as the rest of the API: the
-// pairing page's session or the SECRET as a Bearer token.
 async function webhooks(
   request: Request,
   env: Env,
@@ -219,7 +233,6 @@ async function webhooks(
   }
 }
 
-// What the account refused, such as an 11th webhook or a chat it cannot resolve.
 async function settle<T>(
   work: Promise<T>,
 ): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
@@ -243,7 +256,6 @@ async function hasBearerSecret(request: Request, config: AuthConfig): Promise<bo
   return allowsApiKey(config.mode) && token !== null && (await sameSecret(token, config.secret))
 }
 
-// The only form that takes the secret, so it is rate limited per IP.
 async function signIn(
   request: Request,
   env: Env,
@@ -267,7 +279,6 @@ async function signIn(
   })
 }
 
-// Only paths of this account, so the sign-in form cannot redirect to another site.
 function accountPath(request: Request, accountId: string, next: string): string {
   const origin = new URL(request.url).origin
   const base = `/accounts/${accountId}`
@@ -319,7 +330,6 @@ async function authorize(
     return new Response(null, { status: 302, headers: approved.headers })
   } catch (error) {
     if (error instanceof AuthorizationError) {
-      // redirectTo is set only once the library has checked the client's redirect URI.
       if (error.redirectTo) return Response.redirect(error.redirectTo, 302)
       return html(failurePage(lang, error.description), 400)
     }
