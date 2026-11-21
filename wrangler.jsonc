@@ -3,42 +3,32 @@
   "name": "whatsapp-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-08",
-  // OAuth clients can point the Worker at a metadata URL. This keeps those fetches off private addresses.
   "compatibility_flags": ["global_fetch_strictly_public"],
-  // The pairing page and the MCP endpoint live on the workers.dev address;
-  // per-version preview URLs would only add more ways in.
   "workers_dev": true,
   "preview_urls": false,
   "observability": { "enabled": true },
   "secrets": { "required": ["SECRET"] },
-  // OAuth clients and grants. Created on the first deploy.
-  "kv_namespaces": [{ "binding": "OAUTH_KV" }],
-  // Sign-in attempts per IP.
-  "ratelimits": [
-    { "name": "SIGN_IN_LIMIT", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "0bc55350d7fb4ebcb99423e4b2177f5a"
+    }
   ],
-  // Speech to text for voice messages (billed per audio minute) and image descriptions
-  // (billed per token).
+  "ratelimits": [
+    { "name": "SIGN_IN_LIMIT", "namespace_id": "1001", "simple": { "limit": 5, "period": 60 } }
+  ],
   "ai": { "binding": "AI" },
   "vars": {
-    // IANA zone the tools show and read times in.
-    "TIMEZONE": "UTC",
-    // "@cf/openai/whisper-large-v3-turbo", "@cf/deepgram/nova-3" or "off".
-    "TRANSCRIBE_MODEL": "@cf/openai/whisper-large-v3-turbo",
-    // "@cf/mistralai/mistral-small-3.1-24b-instruct", "@cf/meta/llama-4-scout-17b-16e-instruct" or "off".
-    "DESCRIBE_MODEL": "@cf/mistralai/mistral-small-3.1-24b-instruct",
-    // Language spoken in most voice messages, e.g. "pt". Empty detects it per message.
+    "TIMEZONE": "Africa/Cairo",
+    "TRANSCRIBE_MODEL": "off",
+    "DESCRIBE_MODEL": "off",
     "TRANSCRIBE_LANGUAGE": "",
-    // Language image descriptions are written in, e.g. "pt". English if empty.
     "DESCRIBE_LANGUAGE": "",
-    // "oauth", "api_key" (SECRET as a Bearer token) or "both".
     "AUTH_MODE": "both",
-    // What MCP clients can do with webhooks: "manage", "read" (list only) or "off".
-    // The REST API and the pairing page manage them in every mode.
-    "WEBHOOK_TOOLS": "manage",
+    "WEBHOOK_TOOLS": "manage"
   },
   "durable_objects": {
-    "bindings": [{ "name": "ACCOUNT", "class_name": "WhatsAppAccount" }],
+    "bindings": [{ "name": "ACCOUNT", "class_name": "WhatsAppAccount" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WhatsAppAccount"] }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WhatsAppAccount"] }]
 }
